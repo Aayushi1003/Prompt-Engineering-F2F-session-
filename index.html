@@ -93,6 +93,7 @@ a{color:inherit}
 .col li{background:#fff;border:2px solid var(--dk);border-radius:10px;padding:4px 8px;font-size:14px;display:flex;justify-content:space-between;gap:6px;overflow-wrap:anywhere}
 .col li button{border:0;background:none;cursor:pointer;font-weight:700;color:var(--dk);min-width:24px}
 .col input{font-size:14px;padding:6px 8px;border-width:2px}
+.addrow{display:flex;gap:6px}.addrow input{flex:1;min-width:0}.addrow button{border:2px solid var(--dk);border-radius:10px;background:var(--dk);color:#fff;font-weight:800;font-size:18px;min-width:40px;cursor:pointer}
 .battle{margin-top:14px;border-top:3px dashed var(--soft);padding-top:8px}
 /* prompt wall */
 .wall{columns:3 300px;column-gap:20px}
@@ -238,9 +239,18 @@ const CONFIG = {
   let docs = {}, admin = false, aiEnabled = false, configured = /^https:\/\/script\.google\.com\//.test(CONFIG.API_URL);
   const listeners = new Set();
   const notify = () => listeners.forEach(f => { try { f(); } catch (e) {} });
+  const pending = {}; let seq = 0, applied = 0, lastSig = '';
+  const changed = () => { const sig = JSON.stringify([docs, admin, aiEnabled]); if (sig === lastSig) return; lastSig = sig; notify(); };
   async function poll(){
-    const r = await fetch(CONFIG.API_URL + '?action=state&pin=' + encodeURIComponent(pin) + '&me=' + encodeURIComponent(me));
-    const j = await r.json(); docs = j.docs || {}; admin = !!j.admin; aiEnabled = !!j.aiEnabled; notify();
+    const my = ++seq;
+    const r = await fetch(CONFIG.API_URL + '?action=state&pin=' + encodeURIComponent(pin) + '&me=' + encodeURIComponent(me) + '&t=' + Date.now());
+    const j = await r.json();
+    if (my < applied) return; applied = my;
+    const next = j.docs || {};
+    /* keep this phone's own fresh saves on screen until the server has them */
+    Object.keys(pending).forEach(p => { const w = pending[p];
+      if (JSON.stringify(next[p]) === JSON.stringify(w.data) || Date.now() - w.t > 20000) delete pending[p]; else next[p] = w.data; });
+    docs = next; admin = !!j.admin; aiEnabled = !!j.aiEnabled; changed();
   }
   const ready = configured ? poll().catch(() => {}) : Promise.resolve();
   if (configured) setInterval(() => { if (!document.hidden) poll().catch(() => {}); }, CONFIG.POLL_MS);
@@ -255,13 +265,19 @@ const CONFIG = {
       }
     }
   }
+  async function write(path, data){
+    const before = docs[path];
+    pending[path] = { data, t: Date.now() }; docs[path] = data; changed();
+    try { await api({ action: 'set', path, data }); pending[path] && (pending[path].t = Date.now()); }
+    catch (e) { delete pending[path]; if (before === undefined) delete docs[path]; else docs[path] = before; changed(); throw e; }
+  }
   const snapOf = (path, data) => ({ id: path.split('/').pop(), exists: data !== undefined, data: () => data, metadata: { fromCache: false, hasPendingWrites: false } });
   function docRef(path){
     return {
       id: path.split('/').pop(), path,
       get: async () => { await ready; return snapOf(path, docs[path]); },
-      set: async data => { docs[path] = data; notify(); await api({ action: 'set', path, data }); },
-      update: async data => { const next = { ...(docs[path] || {}), ...data }; docs[path] = next; notify(); await api({ action: 'set', path, data: next }); },
+      set: async data => write(path, data),
+      update: async data => write(path, { ...(docs[path] || {}), ...data }),
       onSnapshot(cb){ const f = () => cb(snapOf(path, docs[path])); listeners.add(f); ready.then(f); return () => listeners.delete(f); }
     };
   }
@@ -365,43 +381,79 @@ $('#lb').addEventListener('change', e => {
 });
 
 /* ---------- team boards ---------- */
+/* Typing is kept in drafts so the live refresh never wipes it; only cards
+   whose data changed are redrawn, and the box you are typing in is never replaced. */
+const drafts = {}, cardSig = {};
+const dkey = el => { const c = el.closest('[data-id]'); return c ? c.dataset.id + '|' + (el.dataset.f || 'add:' + el.dataset.col) : null; };
+const fval = (t, f) => { const d = drafts[t.id + '|' + f]; return d !== undefined ? d : ((t.battle || {})[f] ?? ''); };
+const rolesHTML = (r, k) => (r[k] || []).map((x, n) => `<li><span>${esc(x)}</span><button type="button" data-del="${k}" data-n="${n}" aria-label="Remove">×</button></li>`).join('');
+function cardHTML(t){
+  const r = t.roles || {}, lvl = fval(t, 'level');
+  return `<article class="card" data-id="${esc(t.id)}"><h3>${esc(t.name)}</h3>
+  <div class="cols">${COLS.map(([k, label], j) => `<div class="col ${['c2','c0','c1'][j]}"><h4>${label}</h4><ul>${rolesHTML(r, k)}</ul><div class="addrow"><input class="add" data-col="${k}" maxlength="60" enterkeyhint="done" placeholder="Add a role" aria-label="Add a role to ${label}" value="${esc(drafts[t.id + '|add:' + k] || '')}"><button type="button" data-addrole="${k}" aria-label="Add role to ${label}">+</button></div></div>`).join('')}</div>
+  <div class="battle"><h4 style="margin:8px 0 0">Prompt Battle entry</h4>
+  <label>Level</label><select data-f="level">${['','Bronze','Silver','Gold'].map(l => `<option ${lvl===l?'selected':''} value="${l}">${l||'Choose…'}</option>`).join('')}</select>
+  <label>Role you automated</label><input data-f="role" maxlength="80" value="${esc(fval(t, 'role'))}">
+  <label>Final prompt</label><textarea data-f="prompt" maxlength="3000">${esc(fval(t, 'prompt'))}</textarea>
+  <label>Time saved per week (minutes)</label><input data-f="time" type="number" min="0" inputmode="numeric" value="${esc(fval(t, 'time'))}">
+  <div class="row" style="margin-top:12px"><button class="btn p" type="button" data-save>Save entry</button><span class="small" data-msg></span></div></div></article>`;
+}
+function patchCard(card, t){
+  const r = t.roles || {};
+  card.querySelector('h3').textContent = t.name;
+  card.querySelectorAll('.col').forEach((col, j) => { col.querySelector('ul').innerHTML = rolesHTML(r, COLS[j][0]); });
+  card.querySelectorAll('[data-f]').forEach(f => { if (f !== document.activeElement && drafts[t.id + '|' + f.dataset.f] === undefined) f.value = (t.battle || {})[f.dataset.f] ?? ''; });
+}
 function drawTeams(){
-  const v = $('#v-teams');
-  if (v.contains(document.activeElement) && document.activeElement.matches('textarea,input:not(.add),select')) { pendingTeams = true; return; }
-  pendingTeams = false;
   const el = $('#teams');
-  if (!teams.length) { el.innerHTML = '<p class="empty">No teams yet. Create the first one above.</p>'; return; }
-  el.innerHTML = teams.map((t, i) => {
-    const r = t.roles || {}, b = t.battle || {};
-    return `<article class="card" data-id="${esc(t.id)}"><h3>${esc(t.name)}</h3>
-    <div class="cols">${COLS.map(([k, label], j) => `<div class="col ${['c2','c0','c1'][j]}"><h4>${label}</h4><ul>${(r[k]||[]).map((x, n) => `<li><span>${esc(x)}</span><button type="button" data-del="${k}" data-n="${n}" aria-label="Remove">×</button></li>`).join('')}</ul><input class="add" data-col="${k}" maxlength="60" placeholder="Add a role ↵" aria-label="Add a role to ${label}"></div>`).join('')}</div>
-    <div class="battle"><h4 style="margin:8px 0 0">Prompt Battle entry</h4>
-    <label>Level</label><select data-f="level">${['','Bronze','Silver','Gold'].map(l => `<option ${b.level===l?'selected':''} value="${l}">${l||'Choose…'}</option>`).join('')}</select>
-    <label>Role you automated</label><input data-f="role" maxlength="80" value="${esc(b.role)}">
-    <label>Final prompt</label><textarea data-f="prompt" maxlength="3000">${esc(b.prompt)}</textarea>
-    <label>Time saved per week (minutes)</label><input data-f="time" type="number" min="0" inputmode="numeric" value="${esc(b.time)}">
-    <div class="row" style="margin-top:12px"><button class="btn p" type="button" data-save>Save entry</button></div></div></article>`;
-  }).join('');
+  if (!teams.length) { el.innerHTML = '<p class="empty">No teams yet. Create the first one above.</p>'; Object.keys(cardSig).forEach(k => delete cardSig[k]); return; }
+  const em = el.querySelector('.empty'); if (em) em.remove();
+  const ids = new Set(teams.map(t => t.id));
+  [...el.children].forEach(c => { if (!ids.has(c.dataset.id)) { delete cardSig[c.dataset.id]; c.remove(); } });
+  teams.forEach((t, i) => {
+    const sig = JSON.stringify(t);
+    let card = [...el.children].find(c => c.dataset.id === t.id);
+    if (!card) { const tmp = document.createElement('div'); tmp.innerHTML = cardHTML(t); card = tmp.firstElementChild; el.appendChild(card); }
+    else if (cardSig[t.id] !== sig) {
+      if (card.contains(document.activeElement)) patchCard(card, t);
+      else { const tmp = document.createElement('div'); tmp.innerHTML = cardHTML(t); const fresh = tmp.firstElementChild; card.replaceWith(fresh); card = fresh; }
+    }
+    cardSig[t.id] = sig;
+    if (el.children[i] !== card) el.insertBefore(card, el.children[i]);
+  });
   if (canWrite === false) readOnly();
 }
-$('#v-teams').addEventListener('focusout', () => setTimeout(() => { if (pendingTeams) drawTeams(); }, 0));
-$('#teams').addEventListener('keydown', e => {
-  const i = e.target.closest('input.add'); if (!i || e.key !== 'Enter') return; e.preventDefault();
+const keepDraft = e => { if (e.target.matches('[data-f],input.add')) { const k = dkey(e.target); if (k) drafts[k] = e.target.value; } };
+$('#teams').addEventListener('input', keepDraft);
+$('#teams').addEventListener('change', keepDraft);
+function addRole(i){
   const val = i.value.trim(); if (!val) return;
   const card = i.closest('[data-id]'), t = teams.find(x => x.id === card.dataset.id); if (!t) return;
   const roles = { human: [], copilot: [], drafts: [], ...(t.roles || {}) };
   roles[i.dataset.col] = [...(roles[i.dataset.col] || []), val].slice(0, 40);
-  i.value = '';
-  write(() => db.doc('teams/' + t.id).update({ roles }));
+  const k = dkey(i); i.value = ''; delete drafts[k];
+  write(() => db.doc('teams/' + t.id).update({ roles })).then(ok => { if (!ok && !i.value) { i.value = val; drafts[k] = val; } });
+}
+$('#teams').addEventListener('keydown', e => {
+  const i = e.target.closest('input.add'); if (!i || (e.key !== 'Enter' && e.keyCode !== 13)) return;
+  e.preventDefault(); addRole(i);
 });
 $('#teams').addEventListener('click', e => {
   const card = e.target.closest('[data-id]'); if (!card) return;
   const t = teams.find(x => x.id === card.dataset.id); if (!t) return;
+  const add = e.target.closest('[data-addrole]');
+  if (add) { addRole(card.querySelector(`input.add[data-col="${add.dataset.addrole}"]`)); return; }
   const del = e.target.closest('[data-del]');
   if (del) { const roles = { ...(t.roles || {}) }; roles[del.dataset.del] = (roles[del.dataset.del] || []).filter((_, n) => n !== +del.dataset.n); write(() => db.doc('teams/' + t.id).update({ roles })); }
-  if (e.target.closest('[data-save]')) {
+  const save = e.target.closest('[data-save]');
+  if (save) {
     const battle = {}; card.querySelectorAll('[data-f]').forEach(f => battle[f.dataset.f] = f.value.trim());
-    write(() => db.doc('teams/' + t.id).update({ battle })).then(ok => { if (ok) live('Saved · live', 'on'); });
+    const msg = card.querySelector('[data-msg]'); save.disabled = true; msg.textContent = 'Saving…';
+    write(() => db.doc('teams/' + t.id).update({ battle })).then(ok => {
+      save.disabled = false;
+      if (ok) { Object.keys(battle).forEach(f => delete drafts[t.id + '|' + f]); msg.textContent = 'Saved ✓'; live('Saved · live', 'on'); }
+      else msg.textContent = 'Not saved. Check your connection and tap Save again.';
+    });
   }
 });
 $('#lbteam').addEventListener('submit', e => {
